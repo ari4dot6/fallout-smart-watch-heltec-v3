@@ -1,7 +1,7 @@
 #include <Arduino_GFX_Library.h>
 #include <Wire.h>
-#include "MAX30105.h"
-#include "heartRate.h"
+#include <WiFi.h>
+#include <time.h>
 
 #include "Open_Sans_Hebrew_Bold_80.h"
 #include "Open_Sans_Hebrew_Bold_30.h"
@@ -18,334 +18,190 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 bus, TFT_RST, 0, true, 240, 240, 0, 0);
 
 #include "menu_start.h"
-#include "menu_heart.h"
-#include "menu_data.h"
 
 #define TOUCH0 D0
 #define TOUCH1 D1
 #define TOUCH2 D2
 
 bool t0=false,t1=false,t2=false;
-bool lastT0=false,lastT1=false,lastT2=false;
 
+// ================= WIFI / NTP =================
+// Preencha com os dados da sua rede Wi-Fi antes de gravar na Heltec.
+const char* WIFI_SSID = "SEU_WIFI";
+const char* WIFI_PASSWORD = "SUA_SENHA";
+
+const char* NTP_SERVER_1 = "pool.ntp.org";
+const char* NTP_SERVER_2 = "a.st1.ntp.br";
+const char* NTP_SERVER_3 = "b.st1.ntp.br";
+
+// Sao Paulo / Brasil: UTC-3, sem horario de verao atualmente.
+const char* TZ_INFO = "BRT3";
+
+bool ntpSynced=false;
+uint32_t lastNtpSync=0;
+const uint32_t NTP_RESYNC_INTERVAL = 21600000UL; // 6 horas
 
 // ================= TIME =================
-int HH=16;
-int MIN=30;
+int HH=0;
+int MIN=0;
 int SEC=0;
 
-int DAY=25;
-int MON=4;
-int YEAR=26;
-
-
-// ================= BPM SPO2 =================
-int bpm=100;
-int spo2=100;
-
-
-// ================= MENU =================
-enum MenuState
-{
-MENU_START,
-MENU_HEART,
-MENU_DATA
-};
-
-int currentMenu = MENU_START;
-
-
-// ================= SENSOR =================
-MAX30105 particleSensor;
-
-long lastBeat = 0;
-
-float irAvg=0;
-float redAvg=0;
-
-int bpmSamples[3];
-int spo2Samples[3];
-
-int bpmIndex=0;
-int spo2Index=0;
-
-uint32_t nextMeasure=0;
-
-enum MeasureState
-{
-WAIT_FINGER,
-MEASURE_BPM,
-MEASURE_SPO2
-};
-
-MeasureState measureState=WAIT_FINGER;
-
+int DAY=1;
+int MON=1;
+int YEAR=2026;
 
 // ================= SLEEP =================
 bool screenSleeping=false;
-bool pendingSleep=false;
-
 uint32_t lastTouchTime=0;
-
 #define SLEEP_NORMAL 10000
-#define SLEEP_HEART 180000
-
 
 // ================= TOUCH =================
 void updateTouch()
 {
-t0 = touchRead(TOUCH0) > 80000;
-t1 = touchRead(TOUCH1) > 80000;
-t2 = touchRead(TOUCH2) > 80000;
+  t0 = touchRead(TOUCH0) > 80000;
+  t1 = touchRead(TOUCH1) > 80000;
+  t2 = touchRead(TOUCH2) > 80000;
 
-if(t0||t1||t2)
+  if(t0 || t1 || t2)
+  {
+    lastTouchTime=millis();
+
+    if(screenSleeping)
+      wakeScreen();
+  }
+}
+
+// ================= NTP =================
+bool syncNTP()
 {
-lastTouchTime=millis();
+  if(WiFi.status() != WL_CONNECTED)
+    return false;
 
-if(screenSleeping && t1)
-wakeScreen();
+  configTzTime(TZ_INFO, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo, 10000))
+  {
+    Serial.println("NTP: falha ao obter hora");
+    return false;
+  }
+
+  HH = timeinfo.tm_hour;
+  MIN = timeinfo.tm_min;
+  SEC = timeinfo.tm_sec;
+  DAY = timeinfo.tm_mday;
+  MON = timeinfo.tm_mon + 1;
+  YEAR = timeinfo.tm_year + 1900;
+
+  ntpSynced=true;
+  lastNtpSync=millis();
+
+  Serial.printf("NTP OK: %02d:%02d:%02d %02d/%02d/%04d\n", HH, MIN, SEC, DAY, MON, YEAR);
+  return true;
 }
+
+void connectWiFiAndSync()
+{
+  Serial.println("Conectando ao Wi-Fi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  uint32_t start=millis();
+  while(WiFi.status()!=WL_CONNECTED && millis()-start<15000)
+  {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if(WiFi.status()==WL_CONNECTED)
+  {
+    Serial.print("Wi-Fi OK: ");
+    Serial.println(WiFi.localIP());
+    syncNTP();
+  }
+  else
+  {
+    Serial.println("Wi-Fi indisponivel. Relogio aguardando sincronizacao NTP.");
+  }
 }
-
-
-// ================= CLOCK =================
-uint32_t clockTimer=0;
 
 void updateClock()
 {
-if(millis()-clockTimer<1000) return;
-clockTimer=millis();
+  // A hora e mantida pelo RTC interno do ESP32 depois da sincronizacao NTP.
+  // Fazemos uma nova consulta periodicamente para corrigir eventual deriva.
+  if(WiFi.status()==WL_CONNECTED &&
+     (!ntpSynced || millis()-lastNtpSync>=NTP_RESYNC_INTERVAL))
+  {
+    syncNTP();
+  }
 
-SEC++;
+  static uint32_t displayTimer=0;
+  if(millis()-displayTimer<500) return;
+  displayTimer=millis();
 
-if(SEC>=60){SEC=0;MIN++;}
-if(MIN>=60){MIN=0;HH++;}
-if(HH>=24){HH=0;DAY++;}
-
-int maxDay=data_daysInMonth(MON,YEAR);
-
-if(DAY>maxDay)
-{
-DAY=1;
-MON++;
-
-if(MON>12)
-{
-MON=1;
-YEAR++;
+  struct tm timeinfo;
+  if(getLocalTime(&timeinfo, 20))
+  {
+    HH = timeinfo.tm_hour;
+    MIN = timeinfo.tm_min;
+    SEC = timeinfo.tm_sec;
+    DAY = timeinfo.tm_mday;
+    MON = timeinfo.tm_mon + 1;
+    YEAR = timeinfo.tm_year + 1900;
+  }
 }
-}
-}
-
-
-// ================= SENSOR =================
-void sensorUpdate()
-{
-long ir = particleSensor.getIR();
-long red = particleSensor.getRed();
-
-if(measureState==WAIT_FINGER)
-{
-if(ir>7000)
-{
-measureState=MEASURE_BPM;
-bpmIndex=0;
-spo2Index=0;
-}
-}
-
-else if(measureState==MEASURE_BPM)
-{
-if (checkForBeat(ir))
-{
-long delta = millis() - lastBeat;
-lastBeat = millis();
-
-float beatsPerMinute = 60 / (delta / 1000.0);
-
-if (beatsPerMinute < 180 && beatsPerMinute > 40)
-{
-bpmSamples[bpmIndex++] = beatsPerMinute;
-
-if(bpmIndex>=3)
-{
-int avg=0;
-for(int i=0;i<3;i++) avg+=bpmSamples[i];
-
-bpm = avg/3;
-
-measureState=MEASURE_SPO2;
-}
-}
-}
-}
-
-else if(measureState==MEASURE_SPO2)
-{
-irAvg = irAvg*0.95 + ir*0.05;
-redAvg = redAvg*0.95 + red*0.05;
-
-float acIR = ir - irAvg;
-float acRed = red - redAvg;
-
-float ratio = (acRed/redAvg)/(acIR/irAvg);
-
-int val = 110 - 25 * ratio;
-
-if(val>100) val=100;
-if(val<80) val=80;
-
-static uint32_t t=0;
-
-if(millis()-t>800)
-{
-t=millis();
-
-spo2Samples[spo2Index++] = val;
-
-if(spo2Index>=3)
-{
-int avg=0;
-for(int i=0;i<3;i++) avg+=spo2Samples[i];
-
-spo2 = avg/3;
-
-measureState=WAIT_FINGER;
-
-nextMeasure = millis()+180000;
-}
-}
-}
-}
-
 
 // ================= SLEEP =================
 void sleepScreen()
 {
-screenSleeping=true;
-
-particleSensor.shutDown();
-
-// tắt màn
-ledcWrite(TFT_BL,0);
+  screenSleeping=true;
+  ledcWrite(TFT_BL,0);
 }
-
 
 // ================= WAKE =================
 void wakeScreen()
 {
-screenSleeping=false;
+  screenSleeping=false;
+  ledcWrite(TFT_BL,204);   // 80%
 
-particleSensor.wakeUp();
-particleSensor.setup();
-
-// sáng 80%
-ledcWrite(TFT_BL,204);
-
-gfx->fillScreen(0);
-
-if(currentMenu==MENU_START) start_draw_static();
-if(currentMenu==MENU_HEART) heart_draw_static();
-if(currentMenu==MENU_DATA) data_draw_static();
-
-lastTouchTime=millis();
+  gfx->fillScreen(0);
+  start_draw_static();
+  lastTouchTime=millis();
 }
-
 
 // ================= SETUP =================
 void setup()
 {
-Wire.begin(D4,D5);
+  Serial.begin(115200);
 
-particleSensor.begin(Wire, I2C_SPEED_FAST);
-particleSensor.setup();
+  Wire.begin(D4,D5);
 
-particleSensor.setPulseAmplitudeRed(0x0A);
-particleSensor.setPulseAmplitudeIR(0x0A);
+  pinMode(TFT_BL, OUTPUT);
+  ledcAttach(TFT_BL,5000,8);
+  ledcWrite(TFT_BL,204);   // 80%
 
-// PWM backlight
-pinMode(TFT_BL, OUTPUT);
-ledcAttach(TFT_BL,5000,8);
-ledcWrite(TFT_BL,204);   // 80%
+  gfx->begin();
+  gfx->fillScreen(0);
 
-gfx->begin();
-gfx->fillScreen(0);
+  // Tenta sincronizar a hora pela rede.
+  connectWiFiAndSync();
 
-start_draw_static();
-
-lastTouchTime=millis();
+  start_draw_static();
+  lastTouchTime=millis();
 }
-
 
 // ================= LOOP =================
 void loop()
 {
-updateTouch();
-updateClock();
+  updateTouch();
+  updateClock();
 
-if(millis()>nextMeasure && !screenSleeping)
-sensorUpdate();
+  if(!screenSleeping)
+    start_update();
 
-uint32_t sleepTime =
-(currentMenu==MENU_HEART) ? SLEEP_HEART : SLEEP_NORMAL;
+  if(!screenSleeping && millis()-lastTouchTime>SLEEP_NORMAL)
+    sleepScreen();
 
-//sleep
-if(!screenSleeping && millis()-lastTouchTime>sleepTime)
-pendingSleep=true;
-
-// sleep
-if(pendingSleep && measureState==WAIT_FINGER)
-{
-sleepScreen();
-pendingSleep=false;
-}
-
-if(!screenSleeping)
-{
-switch(currentMenu)
-{
-case MENU_START: start_update(); break;
-case MENU_HEART: heart_update(); break;
-case MENU_DATA: data_update(); break;
-}
-}
-
-if(!editMode && !screenSleeping)
-{
-if(t0 && !lastT0)
-{
-if(currentMenu==MENU_HEART)
-{
-currentMenu=MENU_START;
-gfx->fillScreen(0);
-start_draw_static();
-}
-else if(currentMenu==MENU_DATA)
-{
-currentMenu=MENU_HEART;
-gfx->fillScreen(0);
-heart_draw_static();
-}
-}
-
-if(t2 && !lastT2)
-{
-if(currentMenu==MENU_START)
-{
-currentMenu=MENU_HEART;
-gfx->fillScreen(0);
-heart_draw_static();
-}
-else if(currentMenu==MENU_HEART)
-{
-currentMenu=MENU_DATA;
-gfx->fillScreen(0);
-data_draw_static();
-}
-}
-}
-
-lastT0=t0;
-lastT1=t1;
-lastT2=t2;
+  delay(5);
 }
